@@ -195,3 +195,51 @@ Les jobs suivent un cycle simple :
 
 ```text
 uploaded → queued → processing → done
+```
+
+## En cas d’erreur :
+
+```text
+uploaded → queued → processing → failed
+```
+
+## `Setup`
+
+### Prérequis
+1. Docker
+2. n8n
+3. Redis
+4. PostgreSQL
+5. MinIO
+6. PostgreSQL avec PGVector
+7. Service d’extraction PDF
+
+## Example Architecture Flow
+
+```text
+[PDF Upload]
+   ↓
+[MinIO]
+   ↓
+[PostgreSQL: pdf_jobs]
+   ↓
+[Redis Queue]
+   ↓
+[Worker Workflow]
+   ↓
+[PDF Extraction]
+   ↓
+[PostgreSQL: pdf_documents]
+   ↓
+[Chunking]
+   ↓
+[PostgreSQL: pdf_chunks]
+   ↓
+[Embeddings]
+   ↓
+[PGVector]
+   ↓
+[RAG Query Workflow]
+
+```
+
