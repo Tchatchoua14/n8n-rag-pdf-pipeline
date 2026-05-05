@@ -1,0 +1,2567 @@
+{
+  "name": "asynchronous PDF processing pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "Description workflow :\n\nWorker asynchrone de traitement PDF pour pipeline RAG.\n\nCe workflow récupère périodiquement les jobs PDF en attente depuis Redis, valide le payload reçu, verrouille le traitement en passant le job au statut processing, puis télécharge le fichier depuis MinIO/S3.\n\nIl exécute ensuite l’extraction du contenu PDF via un service HTTP externe, contrôle que le texte extrait est exploitable, enregistre le document dans PostgreSQL, nettoie le texte, le découpe en chunks, puis stocke les blocs dans PostgreSQL avant indexation dans PGVector avec embeddings Gemini.\n\nLe workflow met à jour le statut du job à chaque étape critique afin d’assurer une traçabilité complète : queued, processing, extracted, chunked, embedding, indexed, done ou failed.\n\nChaque erreur métier ou technique est capturée, journalisée dans audit_logs, puis associée au job concerné avec un message explicite. Ce worker est conçu pour un traitement robuste, asynchrone, scalable et compatible avec une architecture SaaS multi-tenant.",
+        "height": 1328,
+        "width": 4592,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1648,
+        880
+      ],
+      "typeVersion": 1,
+      "id": "1c0afad8-9fb1-4664-b93f-1868da1895d8",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "End-to-End Async PDF Processing & RAG Pipeline (n8n + Redis + MinIO + PGVector)\n\nThis template implements a scalable asynchronous PDF processing pipeline.\n\nWorkflow 1 handles file ingestion: it receives a PDF via webhook, uploads it to MinIO (S3-compatible storage), creates a tracking record in PostgreSQL, and pushes a job into a Redis queue.\n\nWorkflow 2 acts as a worker: it consumes jobs from Redis, updates job status to processing, downloads the PDF, extracts and processes its content, and stores results in PostgreSQL.\n\nThe pipeline supports error handling, status tracking, and can be extended with vector embeddings and RAG-based retrieval.",
+        "height": 336,
+        "width": 752,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        32,
+        -384
+      ],
+      "typeVersion": 1,
+      "id": "6bb43fa4-2b30-4090-87fe-4082becf823d",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "c01cc9a0-089f-43af-926e-564d50fcebe9",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1472,
+        384
+      ],
+      "id": "27fb2f9f-8640-4b5f-8c39-c18ea6ff84d0",
+      "name": "Webhook - Réception PDF",
+      "webhookId": "c01cc9a0-089f-43af-926e-564d50fcebe9",
+      "retryOnFail": false,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "8a7aafaa-bb3c-4d1b-8236-6528be08dcf3",
+              "name": "fileName",
+              "value": "={{ $json.fileName }}",
+              "type": "string"
+            },
+            {
+              "id": "9ffae247-457d-4806-aa0c-735affb7cdcd",
+              "name": "key",
+              "value": "={{ \"uploads/\" + $json.tenant_id + \"/\" + Date.now() + \"-\" + $json.fileName }}",
+              "type": "string"
+            },
+            {
+              "id": "60a9a721-07ab-4ed5-9281-3d750038fe4a",
+              "name": "fileSize",
+              "value": "={{ $json.fileSize }}",
+              "type": "string"
+            },
+            {
+              "id": "2f38b0e6-ca5e-48c2-9fca-316d73289caa",
+              "name": "tenant_id",
+              "value": "={{ $json.tenant_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {
+          "stripBinary": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -800,
+        288
+      ],
+      "id": "d844e5cf-462e-496b-ab98-7e42c932a668",
+      "name": "Set - Préparer métadonnées fichier"
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucketName": "pdf-storage",
+        "fileName": "={{ $json.key }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [
+        -576,
+        288
+      ],
+      "id": "d642a41e-8725-44a9-87f1-8485e7e94b7f",
+      "name": "S3 - Upload PDF vers MinIO",
+      "alwaysOutputData": false,
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "s3": {
+          "id": "5a4MixV6JdiBSnr9",
+          "name": "S3 account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.pdf_jobs (\n  id,\n  filename,\n  storage_key,\n  status,\n  tenant_id,\n  file_size,\n  uploaded_at\n)\nVALUES (\n  gen_random_uuid(),\n  $1,\n  $2,\n  'uploaded',\n  $3,\n  $4,\n  NOW()\n)\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [\n  $(\"Set - Préparer métadonnées fichier\").item.json.fileName,\n  $(\"Set - Préparer métadonnées fichier\").item.json.key,\n  $(\"Set - Préparer métadonnées fichier\").item.json.tenant_id || \"tenant-a\",\n  Number($(\"Set - Préparer métadonnées fichier\").item.json.fileSize || 0)\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -128,
+        192
+      ],
+      "id": "a9409313-2e8e-463d-8fef-8538935841b5",
+      "name": "Postgres - Créer job PDF (uploaded)",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "push",
+        "list": "pdf_jobs",
+        "messageData": "={{ JSON.stringify({\n  job_id: $json.id,\n  filename: $json.filename,\n  storage_key: $json.storage_key,\n  tenant_id: $json.tenant_id\n}) }}"
+      },
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        320,
+        96
+      ],
+      "id": "6fc45a6f-ab64-4ac1-9c4f-09ac9846f73a",
+      "name": "Redis - Empiler job PDF",
+      "credentials": {
+        "redis": {
+          "id": "8eDhZCgKrTu5YL03",
+          "name": "Redis account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET \n  status = 'queued',\n  file_size = $1\nWHERE id = $2\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [  Number($json.file_size || 0),  $json.id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        768,
+        0
+      ],
+      "id": "6d8bea9d-d6a6-4e3b-bb15-84f4968bbac3",
+      "name": "Postgres - Marquer job en queued",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c2daeb44-f5de-4607-8975-b818f49bc37d",
+              "name": "job_id",
+              "value": "={{ ($json.job?.job_id || '').replace(/^=/, '') }}",
+              "type": "string"
+            },
+            {
+              "id": "53d61741-aa4e-4e7f-944c-1a6c9022c153",
+              "name": "filename",
+              "value": "={{ ($json.job?.filename || '').replace(/^=/, '') }}",
+              "type": "string"
+            },
+            {
+              "id": "06b387a8-58e4-44fd-8784-737e3801fa2c",
+              "name": "storage_key",
+              "value": "={{ ($json.job?.storage_key || '').replace(/^=/, '') }}",
+              "type": "string"
+            },
+            {
+              "id": "8795407d-d88c-4109-b623-008c24a68f88",
+              "name": "tenant_id",
+              "value": "={{ ($json.job?.tenant_id || '').replace(/^=/, '') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -800,
+        1552
+      ],
+      "id": "a335f76e-921b-4470-9a7b-36c6884a0c3d",
+      "name": "Set - Normaliser payload job"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET \n  started_at = NOW(),\n  status = 'processing'\nWHERE id = $1\n  AND status = 'queued'\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.job_id] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -352,
+        1456
+      ],
+      "id": "55c7fe36-0df5-4256-86b4-fe17975585ac",
+      "name": "Postgres - Marquer job en processing",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "bucketName": "pdf-storage",
+        "fileKey": "={{ $json.storage_key }}"
+      },
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [
+        96,
+        1360
+      ],
+      "id": "3465abb8-1020-4e4d-8867-3577181e3963",
+      "name": "S3 - Télécharger PDF",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "s3": {
+          "id": "5a4MixV6JdiBSnr9",
+          "name": "S3 account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'done'\nWHERE id = $1\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [   $(\"Set - Normaliser payload job\").item.json.job_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2624,
+        1680
+      ],
+      "id": "4f7e56e7-e1d2-4d98-ab89-fe0e2d0493c9",
+      "name": "Postgres - Marquer job en done",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = $1\nWHERE id = $2\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.error_message || \"Erreur inconnue\",\n  $(\"Set - Normaliser payload job\").item.json.job_id\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1216,
+        1312
+      ],
+      "id": "d653bb7d-44f8-4adf-8d9b-32842af5f907",
+      "name": "Postgres - Marquer job en failed",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/extract",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        544,
+        1264
+      ],
+      "id": "d717f80d-a6a8-4c51-ac38-707b66e86760",
+      "name": "HTTP - Extraire contenu PDF",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.pdf_documents (\n  job_id, tenant_id, filename, storage_key, \n  extracted_text, page_count, content_type, extraction_status\n)\nVALUES ($1, $2, $3, $4, $5, $6, $7, 'extracted')\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.job_id,\n  $json.tenant_id,\n  $json.filename,\n  $json.storage_key,\n  $json.extracted_text,\n  $json.page_count,\n  $json.content_type,\n  'extracted'\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1440,
+        992
+      ],
+      "id": "819d7f67-69b8-4b34-927f-a665ed089ae3",
+      "name": "Postgres - Enregistrer document extrait",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nlet text = item.json.extracted_text || \"\";\n\n// normalisation basique\ntext = text\n  .replace(/\\r/g, \"\\n\")\n  .replace(/\\t/g, \" \")\n  .replace(/\\u0000/g, \" \")\n  .replace(/[ ]{2,}/g, \" \")\n  .replace(/\\n{3,}/g, \"\\n\\n\")\n  .trim();\n\n// fusion légère des lignes cassées\ntext = text\n  .split(\"\\n\")\n  .map(line => line.trim())\n  .filter(line => line.length > 0)\n  .join(\"\\n\");\n\nreturn [\n  {\n    json: {\n      ...item.json,\n      clean_text: text\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1664,
+        992
+      ],
+      "id": "69613c53-645e-4f32-8ff4-d17df8df3cb3",
+      "name": "Code - Nettoyer texte extrait"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\n\nconst text = item.json.clean_text || \"\";\nconst chunkSize = 1200;   // taille approximative en caractères\nconst overlap = 200;      // recouvrement entre chunks\n\nif (!text.trim()) {\n  return [];\n}\n\nconst chunks = [];\nlet start = 0;\nlet index = 0;\n\nwhile (start < text.length) {\n  let end = start + chunkSize;\n\n  if (end < text.length) {\n    const lastSpace = text.lastIndexOf(\" \", end);\n    if (lastSpace > start + 200) {\n      end = lastSpace;\n    }\n  }\n\n  const chunkText = text.slice(start, end).trim();\n\n  if (chunkText) {\n    chunks.push({\n      json: {\n        job_id: item.json.job_id,\n        tenant_id: item.json.tenant_id,\n        filename: item.json.filename,\n        storage_key: item.json.storage_key,\n        chunk_index: index,\n        chunk_text: chunkText\n      }\n    });\n    index++;\n  }\n\n  const nextStart = end - overlap;\n  start = nextStart > start ? nextStart : end;\n  \n}\n\nreturn chunks;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        992
+      ],
+      "id": "924f73d3-8ad8-49ec-9f72-94a686445ee4",
+      "name": "Code - Découper en chunk"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO public.pdf_chunks (\n  job_id,\n  tenant_id,\n  filename,\n  storage_key,\n  chunk_index,\n  chunk_text\n)\nVALUES ($1, $2, $3, $4, $5, $6)\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.job_id, $json.tenant_id, $json.filename, $json.storage_key, $json.chunk_index, $json.chunk_text] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2336,
+        896
+      ],
+      "id": "caa23cef-4ca1-49b4-ba39-fa2b606a662a",
+      "name": "Postgres - Enregistrer chunks",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [
+        2560,
+        1280
+      ],
+      "id": "3b7cbb09-6d27-49af-8d97-e482c1e80223",
+      "name": "Postgres PGVector Store",
+      "credentials": {
+        "postgres": {
+          "id": "039nvylESF5ZxaeC",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonMode": "expressionData",
+        "jsonData": "={{ $json.chunk_text }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        2704,
+        1504
+      ],
+      "id": "46e47db6-4bb6-45ba-bbb2-167553b4f849",
+      "name": "Default Data Loader"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [
+        -672,
+        3088
+      ],
+      "id": "a7dd69ad-e305-4448-8990-e728aba18bf6",
+      "name": "Postgres PGVector Store1",
+      "credentials": {
+        "postgres": {
+          "id": "039nvylESF5ZxaeC",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -1472,
+        2416
+      ],
+      "id": "11b6d7a6-8d08-492c-b98b-4962566a1e00",
+      "name": "Chat - Recevoir la question utilisateur",
+      "webhookId": "5bcf8bdb-a708-40ae-ab85-55938cfb1203"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainRetrievalQa",
+      "typeVersion": 1.7,
+      "position": [
+        -768,
+        2656
+      ],
+      "id": "51eeae31-18a6-4b28-a7f5-488188557f7a",
+      "name": "RAG - Générer la réponse à partir des documents"
+    },
+    {
+      "parameters": {
+        "topK": 5
+      },
+      "type": "@n8n/n8n-nodes-langchain.retrieverVectorStore",
+      "typeVersion": 1,
+      "position": [
+        -672,
+        2880
+      ],
+      "id": "05163694-838d-45d7-ac54-e5a1896b2d2c",
+      "name": "Vector Store - Base documentaire PGVector"
+    },
+    {
+      "parameters": {
+        "content": "Ce workflow correspond au pipeline de question/réponse RAG.\nIl reçoit une question utilisateur, recherche les chunks les plus pertinents dans la base vectorielle, puis utilise un modèle de langage pour générer une réponse fondée sur les documents indexés.",
+        "height": 1344,
+        "width": 4608,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1664,
+        2208
+      ],
+      "typeVersion": 1,
+      "id": "f658634d-dc94-4869-ba42-34c7260ebe7c",
+      "name": "Sticky Note5"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        2880
+      ],
+      "id": "6b1a7fa9-461c-4653-b9ce-3bdfd3c95183",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KFVt0zygfkRrj7fo",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-embedding-001"
+      },
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -592,
+        3296
+      ],
+      "id": "f754f1d4-1245-4e4e-a6a3-6c72cd77c2f5",
+      "name": "Embeddings Google Gemini",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KFVt0zygfkRrj7fo",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-embedding-001"
+      },
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2576,
+        1504
+      ],
+      "id": "59619b10-d84e-436f-bf68-fd2f5170c051",
+      "name": "Embeddings Google Gemini1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "KFVt0zygfkRrj7fo",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2336,
+        1536
+      ],
+      "id": "d3217cfb-4a52-48c8-aa0b-adb45cedf719",
+      "name": "Loop Over Items",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nconst file = item.binary?.data;\n\nconst errors = [];\nconst maxSizeMB = 50;\nconst maxSizeBytes = maxSizeMB * 1024 * 1024;\n\n/**\n * Convertit \"13.7 kB\" → bytes\n */\nfunction parseFileSizeToBytes(value) {\n  if (typeof value === \"number\") return value;\n\n  if (!value || typeof value !== \"string\") return NaN;\n\n  const normalized = value.trim().toLowerCase();\n  const match = normalized.match(/^([\\d.]+)\\s*(b|kb|kib|mb|mib|gb|gib)?$/);\n\n  if (!match) return NaN;\n\n  const number = parseFloat(match[1]);\n  const unit = match[2] || \"b\";\n\n  const multipliers = {\n    b: 1,\n    kb: 1024,\n    kib: 1024,\n    mb: 1024 * 1024,\n    mib: 1024 * 1024,\n    gb: 1024 * 1024 * 1024,\n    gib: 1024 * 1024 * 1024\n  };\n\n  return number * multipliers[unit];\n}\n\nif (!file) {\n  errors.push(\"Aucun fichier reçu dans $binary.data\");\n}\n\nconst fileName = file?.fileName || \"\";\nconst mimeType = file?.mimeType || \"\";\n\n// ✅ ICI on remplace Number() par ta fonction\nconst fileSizeRaw = file?.fileSize;\nconst fileSize = parseFileSizeToBytes(fileSizeRaw);\n\nif (file) {\n  if (!fileName) {\n    errors.push(\"Nom de fichier manquant\");\n  }\n\n  if (!fileName.toLowerCase().endsWith(\".pdf\")) {\n    errors.push(\"Extension invalide: seul .pdf est accepté\");\n  }\n\n  if (!mimeType || !mimeType.toLowerCase().includes(\"pdf\")) {\n    errors.push(`Type MIME invalide: ${mimeType || \"inconnu\"}`);\n  }\n\n  if (!Number.isFinite(fileSize)) {\n    errors.push(`Taille fichier invalide: ${fileSizeRaw}`);\n  }\n\n  if (Number.isFinite(fileSize) && fileSize <= 0) {\n    errors.push(\"Taille fichier égale à 0\");\n  }\n\n  if (Number.isFinite(fileSize) && fileSize > maxSizeBytes) {\n    errors.push(`Fichier trop lourd: limite ${maxSizeMB}MB`);\n  }\n}\n\nreturn [\n  {\n    json: {\n      ...item.json,\n      fileName,\n      mimeType,\n      fileSize,\n      tenant_id: item.json.tenant_id || \"tenant-a\",\n      is_valid_file: errors.length === 0,\n      error_message: errors.join(\" | \"),\n      validation_errors: errors\n    },\n    binary: item.binary\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1248,
+        384
+      ],
+      "id": "5b2d44bf-4821-4755-bcc4-75f8d4ffacf0",
+      "name": "Code - Valider fichier PDF"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "24c31f18-cefe-494a-ace0-f973c6f6bd0d",
+              "leftValue": "={{ $json.is_valid_file }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1024,
+        384
+      ],
+      "id": "7044a46f-5207-4bda-9396-da83bc98ae0c",
+      "name": "IF - Fichier PDF valide ?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": false,\n  \"message\": \"{{ $json.error_message }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -352,
+        480
+      ],
+      "id": "963e167d-aee0-4a1e-8c9c-6a0b65c0a87e",
+      "name": "Respond to Webhook - Erreur fichier"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [  $json.job_id || null,  \"error\",  $json.error_message,  JSON.stringify($json.validation_errors || [])] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -576,
+        480
+      ],
+      "id": "45df4bfc-1bfa-4d41-a7cc-793fb9faec71",
+      "name": "Postgres audit_logs",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"{{ $json.error_message }}\",\n  \"status\": \"failed\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -800,
+        480
+      ],
+      "id": "fa831997-b453-4cc7-86ed-b10425fa69e6",
+      "name": "Node Set (erreur)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "24c31f18-cefe-494a-ace0-f973c6f6bd0d",
+              "leftValue": "={{ !$json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -352,
+        288
+      ],
+      "id": "8a359600-d124-4488-a60f-89bc97e2d39d",
+      "name": "IF - Upload S3 OK ?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [\n  null,\n  \"error\",\n  \"Erreur upload S3 / MinIO\",\n  JSON.stringify({\n    source: \"s3_upload\",\n    fileName: $(\"Set - Préparer métadonnées fichier\").item.json.fileName,\n    storage_key: $(\"Set - Préparer métadonnées fichier\").item.json.key,\n    tenant_id: $(\"Set - Préparer métadonnées fichier\").item.json.tenant_id,\n    error: $json.error || $json\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        96,
+        672
+      ],
+      "id": "c9844ce2-584e-4b25-9620-4d786a6e4688",
+      "name": "Postgres - Insert audit_logs2",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"success\": false,\n  \"status\": \"failed\",\n  \"message\": \"Erreur upload S3 / MinIO\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        320,
+        672
+      ],
+      "id": "31140f1e-9519-48f3-8e26-078353cb64bb",
+      "name": "Respond to Webhook - Erreur upload S3"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, status: \"queued\", job_id: $(\"Postgres - Marquer job en queued\").item.json.id, message: \"PDF reçu et mis en file.\" }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1216,
+        -96
+      ],
+      "id": "3ba8c7da-5fb9-4c5e-a02f-762663cfec2d",
+      "name": "Respond to Webhook 202"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": false,\n  \"status\": \"failed\",\n  \"error_message\": \"Erreur upload S3 / MinIO\",\n  \"source\": \"s3_upload\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -128,
+        672
+      ],
+      "id": "e6c06dc6-f65e-4042-8bd6-889209079b0a",
+      "name": "Node Set (erreur) Upload S3 OFF"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "24c31f18-cefe-494a-ace0-f973c6f6bd0d",
+              "leftValue": "={{ $json.error === undefined && $json.id !== undefined && $json.id !== \"\" }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        96,
+        192
+      ],
+      "id": "6b7f0621-069e-4958-9888-34d2159beea8",
+      "name": "IF - Job Postgres créé ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": false,\n  \"status\": \"failed\",\n  \"error_message\": \"Erreur création job PostgreSQL\",\n  \"source\": \"postgres_create_job\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        320,
+        480
+      ],
+      "id": "a84fd454-f614-416c-b79f-8ca888c09601",
+      "name": "Set - Erreur création job Postgres"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [\n  null,\n  \"error\",\n  $(\"Set - Erreur création job Postgres\").item.json.error_message,\n  JSON.stringify({\n    source: \"postgres_create_job\",\n    fileName: $(\"Set - Préparer métadonnées fichier\").item.json.fileName,\n    storage_key: $(\"Set - Préparer métadonnées fichier\").item.json.key,\n    tenant_id: $(\"Set - Préparer métadonnées fichier\").item.json.tenant_id,\n    error: $json.error || $json\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        544,
+        480
+      ],
+      "id": "96c17940-b5e9-499e-87e1-4c4777615f29",
+      "name": "Postgres - Log erreur create job",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"success\": false,\n  \"status\": \"failed\",\n  \"message\": \"Erreur serveur pendant la création du job.\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        768,
+        480
+      ],
+      "id": "57762050-df76-462b-9435-6d4b23123702",
+      "name": "Respond to Webhook - Erreur create job"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "24c31f18-cefe-494a-ace0-f973c6f6bd0d",
+              "leftValue": "={{ !$json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        544,
+        96
+      ],
+      "id": "ab81a47c-bd53-4393-b77b-a05dd83d3de1",
+      "name": "IF - Redis push OK ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": false,\n  \"status\": \"failed\",\n  \"error_message\": \"Erreur ajout job dans Redis\",\n  \"source\": \"redis_push\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        768,
+        288
+      ],
+      "id": "2c9a6749-8c10-4ce2-8284-cc9546eeabaf",
+      "name": "Set - Erreur Redis push"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [\n  $(\"Postgres - Créer job PDF (uploaded)\").item.json.id || null,\n  \"error\",\n  $(\"Set - Erreur Redis push\").item.json.error_message,\n  JSON.stringify({\n    source: \"redis_push\",\n    job_id: $(\"Postgres - Créer job PDF (uploaded)\").item.json.id,\n    filename: $(\"Postgres - Créer job PDF (uploaded)\").item.json.filename,\n    tenant_id: $(\"Postgres - Créer job PDF (uploaded)\").item.json.tenant_id,\n    error: $json.error || $json\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        992,
+        288
+      ],
+      "id": "bd211ade-8252-459c-83e2-716b6a0fd9b0",
+      "name": "Postgres - Log erreur Redis",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"success\": false,\n  \"status\": \"failed\",\n  \"message\": \"Erreur serveur pendant la mise en file de traitement.\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1216,
+        288
+      ],
+      "id": "6a6c8692-530e-4c96-9f63-97b926efc35a",
+      "name": "Respond to Webhook - Erreur Redis"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\n  \"success\": false,\n  \"status\": \"failed\",\n  \"message\": \"Erreur serveur pendant la finalisation de la mise en file.\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1664,
+        96
+      ],
+      "id": "e919d80f-7cfd-49bf-984c-6796dacee46f",
+      "name": "Respond to Webhook - Erreur queued"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": false,\n  \"status\": \"failed\",\n  \"error_message\": \"Erreur mise à jour du job en queued\",\n  \"source\": \"postgres_update_queued\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1216,
+        96
+      ],
+      "id": "4064fa35-0294-4e9e-9f4e-3f222182806a",
+      "name": "Set - Erreur update queued"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [\n  $(\"Postgres - Créer job PDF (uploaded)\").item.json.id || null,\n  \"error\",\n  $(\"Set - Erreur update queued\").item.json.error_message,\n  JSON.stringify({\n    source: \"postgres_update_queued\",\n    job_id: $(\"Postgres - Créer job PDF (uploaded)\").item.json.id,\n    error: $json.error || $json\n  })\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1440,
+        96
+      ],
+      "id": "5f9290ec-3e36-4819-b14c-669e18aef8fa",
+      "name": "Postgres - Log erreur queued",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "24c31f18-cefe-494a-ace0-f973c6f6bd0d",
+              "leftValue": "={{ !$json.error && $json.id && $json.status === \"queued\" }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        992,
+        0
+      ],
+      "id": "769192e9-408e-43b4-984c-acf627b11e96",
+      "name": "IF - Job marqué queued ?"
+    },
+    {
+      "parameters": {
+        "content": "Workflow 1 — Ingestion PDF\nCe workflow gère la réception et la mise en file d'attente des fichiers PDF envoyés par les clients.\nIl est déclenché par un appel HTTP POST sur le webhook d'upload. À réception, il valide le fichier binaire (extension, type MIME, taille max 50 MB, présence du fichier), puis vérifie que le tenant_id est bien présent avant tout traitement.\nSi la validation échoue, le workflow retourne immédiatement une réponse 400/422 explicite et journalise l'erreur dans audit_logs sans poursuivre.\nSi le fichier est valide, le workflow :\n\nPrépare les métadonnées et construit la clé S3 isolée par tenant (uploads/{tenant_id}/{timestamp}-{filename})\nUploade le PDF dans le bucket MinIO pdf-storage\nCrée un enregistrement dans pdf_jobs avec le statut uploaded\nPousse le job dans la queue Redis pdf_jobs\nMet à jour le statut du job en queued\nRetourne une réponse 202 avec le job_id pour que le client puisse suivre l'avancement\n\nChaque étape critique (upload S3, création Postgres, push Redis, mise à jour statut) dispose de sa propre branche d'erreur avec audit_logs et réponse HTTP explicite. Aucune étape ne peut échouer silencieusement.\nEntrée : POST /webhook/upload — multipart/form-data avec le PDF + header x-api-key + header x-tenant-id\nSortie succès : 202 { success: true, status: \"queued\", job_id: \"...\" }\nSortie erreur : 400 / 413 / 415 / 422 / 500 selon le cas d'échec",
+        "height": 1328,
+        "width": 4592
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -1648,
+        -448
+      ],
+      "typeVersion": 1,
+      "id": "440c2417-6af9-4dcd-8567-ca4da19c6116",
+      "name": "Sticky Note6"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ !!$json.job_id && !!$json.storage_key && !!$json.tenant_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -576,
+        1552
+      ],
+      "id": "12e97f82-e4d7-451e-af0d-7d66a31643d9",
+      "name": "IF — job existe ?1"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"{{ $json.error_message }}\",\n  \"status\": \"failed\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -352,
+        1648
+      ],
+      "id": "6d7c1134-96e1-4837-9a4d-6ad9d9b27ed4",
+      "name": "Node Set (erreur)4"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"{{ $json.error_message }}\",\n  \"status\": \"failed\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        96,
+        1552
+      ],
+      "id": "f0c9666a-d7d3-46c1-a6cb-ff89bb0822de",
+      "name": "Node Set (erreur)5"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ !$json.error && !!$json.id && $json.status === \"processing\" }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -128,
+        1456
+      ],
+      "id": "d6626e0e-427c-4d51-8f40-fbfc174e8967",
+      "name": "IF - Job marqué processing ?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ !$json.error && !!$binary.data }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        320,
+        1360
+      ],
+      "id": "fdd49411-b7cb-46a3-929e-b324ae2fc4f6",
+      "name": "IF - PDF téléchargé ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"Erreur téléchargement PDF depuis MinIO\",\n  \"source\": \"s3_download\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        544,
+        1456
+      ],
+      "id": "f790f711-7ff6-4f62-bb66-0343ded8a108",
+      "name": "Set - Erreur S3 download"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = $1\nWHERE id = $2\nRETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.error_message || \"Erreur téléchargement PDF depuis MinIO\",\n  $(\"Set - Normaliser payload job\").item.json.job_id\n] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        768,
+        1456
+      ],
+      "id": "3c23a4f7-0266-4158-bdda-1b354cdee7af",
+      "name": "Postgres - Mark failed",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ !$json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        768,
+        1264
+      ],
+      "id": "0afe4760-0f6f-485f-a268-e21e40f950c4",
+      "name": "IF - Extraction HTTP OK ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"Erreur extraction PDF\",\n  \"source\": \"http_extract\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        992,
+        1312
+      ],
+      "id": "59e91e35-c48a-4165-bdc7-e33444c907ed",
+      "name": "Set - Erreur extraction PDF"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ (($json.extracted_text || $json.text || \"\").trim().length) > 30 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1216,
+        1088
+      ],
+      "id": "f27b71ac-f3c8-442f-9310-5af8359ac712",
+      "name": "IF - Texte extrait non vide ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"PDF vide ou aucun texte exploitable détecté\",\n  \"source\": \"empty_extracted_text\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1440,
+        1184
+      ],
+      "id": "107b8979-7c35-42ae-91ae-cab400b44d2e",
+      "name": "Set - Erreur texte vide"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = 'Aucun chunk généré après nettoyage du texte'\nWHERE id = '{{ $json.id }}'\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2624,
+        1088
+      ],
+      "id": "dc61d741-57d9-4bae-b3dd-ad57eb9a3645",
+      "name": "Postgres - audit_logs worker2",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ $items().length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2112,
+        992
+      ],
+      "id": "a8a4f800-0c16-4bbf-816f-3be58fb6ecdf",
+      "name": "IF - Chunks existent ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"PDF vide ou aucun texte exploitable détecté\",\n  \"source\": \"empty_extracted_text\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2336,
+        1088
+      ],
+      "id": "9f4423b4-b88f-48a8-b49f-7669b2fa53e7",
+      "name": "Set - Erreur aucun chunk"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": "={{ 30 }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1472,
+        1744
+      ],
+      "id": "23e8daf3-b09f-479a-a237-50030ba0d0b1",
+      "name": "Schedule - Worker PDF"
+    },
+    {
+      "parameters": {
+        "operation": "pop",
+        "list": "pdf_jobs",
+        "tail": true,
+        "propertyName": "job",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        -1248,
+        1744
+      ],
+      "id": "f14d27b4-9d7c-4585-8398-21783c7b688b",
+      "name": "Redis - Pop job PDF",
+      "credentials": {
+        "redis": {
+          "id": "8eDhZCgKrTu5YL03",
+          "name": "Redis account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ $json.job !== null && $json.job !== undefined }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1024,
+        1648
+      ],
+      "id": "cae79422-0dd6-4e44-bba5-03c2ee8b34d5",
+      "name": "IF - Job Redis existe ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"{{ $json.error_message }}\",\n  \"status\": \"failed\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1024,
+        1936
+      ],
+      "id": "e0196ce6-3fa4-4d42-9e76-4c6291ebd7c4",
+      "name": "Set - Erreur payload Redis invalide"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"error_message\": \"{{ $json.error_message }}\",\n  \"status\": \"failed\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -800,
+        1744
+      ],
+      "id": "d5007524-d79c-4fae-a034-40d2518768ef",
+      "name": "Set - Erreur lock processing"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [  $(\"Set - Normaliser payload job\").item.json.job_id || null,  \"error\",  $json.error_message || \"Erreur worker\",  JSON.stringify({    source: $json.source || \"worker\",    tenant_id: $(\"Set - Normaliser payload job\").item.json.tenant_id,    filename: $(\"Set - Normaliser payload job\").item.json.filename,    storage_key: $(\"Set - Normaliser payload job\").item.json.storage_key,    raw: $json  })] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1664,
+        1184
+      ],
+      "id": "14c88e8b-0b82-415e-a469-605c76f545b3",
+      "name": "Postgres - Log erreur worker",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const extraction = $input.first().json;\nconst job = $(\"Set - Normaliser payload job\").item.json;\n\nreturn [\n  {\n    json: {\n      ...job,\n      extracted_text: extraction.extracted_text || extraction.text || \"\",\n      page_count: extraction.page_count || extraction.pages || null,\n      content_type: extraction.content_type || \"application/pdf\"\n    },\n    binary: $input.first().binary\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        992,
+        1088
+      ],
+      "id": "63cf66a9-1c4c-4ff9-ba2a-6d7113020d76",
+      "name": "Code - Fusionner job + extraction"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = 'PDF extraction failed'\nWHERE id = '{{ $json.id }}'\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -800,
+        1936
+      ],
+      "id": "1f8b3f8a-da2b-4c6f-abeb-41e7e0611250",
+      "name": "Postgres - Marquer failed payload Redis",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = 'PDF extraction failed'\nWHERE id = '{{ $json.id }}'\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -576,
+        1744
+      ],
+      "id": "cb606aa6-1c9f-49aa-b92a-68b0978052c7",
+      "name": "Postgres - Marquer failed job absent",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_logs (\n  job_id,\n  level,\n  message,\n  details\n)\nVALUES ($1, $2, $3, $4);",
+        "options": {
+          "queryReplacement": "={{ [  $json.job_id || null,  \"error\",  \"Payload job Redis invalide\",  JSON.stringify({    source: \"redis_payload_validation\",    payload: $json  })] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -128,
+        1648
+      ],
+      "id": "167a6406-09fd-43b3-9649-a2c5bb43efa5",
+      "name": "Postgres - Marquer failed processing impossible",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.pdf_jobs\nSET\n  finished_at = NOW(),\n  status = 'failed',\n  error_message = 'Impossible de passer le job en processing'\nWHERE id = '{{ $json.id }}'\nRETURNING *;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        320,
+        1552
+      ],
+      "id": "7aa1cde2-bad7-489e-ab45-7387faf0fb14",
+      "name": "Postgres - Marquer failed aucun chunk",
+      "credentials": {
+        "postgres": {
+          "id": "hOFDtZcMDBz2Idwq",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"question\": \"{{ $json.chatInput || $json.message || $json.question }}\",\n  \"tenant_id\": \"{{ $json.tenant_id || 'tenant-a' }}\",\n  \"session_id\": \"{{ $json.sessionId || $execution.id }}\",\n  \"source\": \"rag_chat\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1248,
+        2416
+      ],
+      "id": "05f720ba-8b5a-4531-a49e-96247390a896",
+      "name": "Set - Préparer contexte utilisateur"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "59c635f2-026b-438d-b256-f8714f168194",
+              "leftValue": "={{ !!$json.question && $json.question.trim().length >= 3 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1024,
+        2416
+      ],
+      "id": "387ea859-34b3-4e46-ae38-69458931ecb2",
+      "name": "IF - Question valide ?"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": false,\n  \"message\": \"Question invalide ou trop courte.\",\n  \"answer\": null\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -528,
+        2304
+      ],
+      "id": "9943326d-7601-47b0-9998-de62aaea3639",
+      "name": "Set - Question invalide"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"success\": true,\n  \"tenant_id\": \"{{ $('Set - Préparer contexte utilisateur').item.json.tenant_id }}\",\n  \"question\": \"{{ $('Set - Préparer contexte utilisateur').item.json.question }}\",\n  \"answer\": \"{{ $('RAG - Générer la réponse à partir des documents').item.json.output || $('RAG - Générer la réponse à partir des documents').item.json.text || $('RAG - Générer la réponse à partir des documents').item.json.answer }}\",\n  \"session_id\": \"{{ $('Set - Préparer contexte utilisateur').item.json.session_id }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -304,
+        2656
+      ],
+      "id": "61f68d4b-4489-4c85-a996-02d7a2e2c92d",
+      "name": "Set - Réponse finale RAG"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Réception PDF": {
+      "main": [
+        [
+          {
+            "node": "Code - Valider fichier PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Préparer métadonnées fichier": {
+      "main": [
+        [
+          {
+            "node": "S3 - Upload PDF vers MinIO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "S3 - Upload PDF vers MinIO": {
+      "main": [
+        [
+          {
+            "node": "IF - Upload S3 OK ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Créer job PDF (uploaded)": {
+      "main": [
+        [
+          {
+            "node": "IF - Job Postgres créé ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis - Empiler job PDF": {
+      "main": [
+        [
+          {
+            "node": "IF - Redis push OK ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Normaliser payload job": {
+      "main": [
+        [
+          {
+            "node": "IF — job existe ?1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Marquer job en processing": {
+      "main": [
+        [
+          {
+            "node": "IF - Job marqué processing ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "S3 - Télécharger PDF": {
+      "main": [
+        [
+          {
+            "node": "IF - PDF téléchargé ?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "HTTP - Extraire contenu PDF": {
+      "main": [
+        [
+          {
+            "node": "IF - Extraction HTTP OK ?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Postgres - Enregistrer document extrait": {
+      "main": [
+        [
+          {
+            "node": "Code - Nettoyer texte extrait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Nettoyer texte extrait": {
+      "main": [
+        [
+          {
+            "node": "Code - Découper en chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Découper en chunk": {
+      "main": [
+        [
+          {
+            "node": "IF - Chunks existent ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Enregistrer chunks": {
+      "main": [
+        []
+      ]
+    },
+    "Postgres PGVector Store": {
+      "main": [
+        []
+      ]
+    },
+    "Default Data Loader": {
+      "ai_document": [
+        [
+          {
+            "node": "Postgres PGVector Store",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres PGVector Store1": {
+      "ai_vectorStore": [
+        [
+          {
+            "node": "Vector Store - Base documentaire PGVector",
+            "type": "ai_vectorStore",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Marquer job en failed": {
+      "main": [
+        []
+      ]
+    },
+    "Chat - Recevoir la question utilisateur": {
+      "main": [
+        [
+          {
+            "node": "Set - Préparer contexte utilisateur",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RAG - Générer la réponse à partir des documents": {
+      "main": [
+        [
+          {
+            "node": "Set - Réponse finale RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Vector Store - Base documentaire PGVector": {
+      "ai_retriever": [
+        [
+          {
+            "node": "RAG - Générer la réponse à partir des documents",
+            "type": "ai_retriever",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "RAG - Générer la réponse à partir des documents",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Postgres PGVector Store1",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini1": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Postgres PGVector Store",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer job en done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres PGVector Store",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Valider fichier PDF": {
+      "main": [
+        [
+          {
+            "node": "IF - Fichier PDF valide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Fichier PDF valide ?": {
+      "main": [
+        [
+          {
+            "node": "Set - Préparer métadonnées fichier",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Node Set (erreur)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Node Set (erreur)": {
+      "main": [
+        [
+          {
+            "node": "Postgres audit_logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Upload S3 OK ?": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Créer job PDF (uploaded)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Node Set (erreur) Upload S3 OFF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Marquer job en queued": {
+      "main": [
+        [
+          {
+            "node": "IF - Job marqué queued ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Node Set (erreur) Upload S3 OFF": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Insert audit_logs2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres audit_logs": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook - Erreur fichier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Insert audit_logs2": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook - Erreur upload S3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Job Postgres créé ?": {
+      "main": [
+        [
+          {
+            "node": "Redis - Empiler job PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur création job Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur création job Postgres": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log erreur create job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Log erreur create job": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook - Erreur create job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Redis push OK ?": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer job en queued",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur Redis push",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur Redis push": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log erreur Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Log erreur Redis": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook - Erreur Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur update queued": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log erreur queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Log erreur queued": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook - Erreur queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Job marqué queued ?": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur update queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF — job existe ?1": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer job en processing",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code - Fusionner job + extraction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Node Set (erreur)4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Node Set (erreur)4": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer failed processing impossible",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Node Set (erreur)5": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer failed aucun chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Job marqué processing ?": {
+      "main": [
+        [
+          {
+            "node": "S3 - Télécharger PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Node Set (erreur)5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - PDF téléchargé ?": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Extraire contenu PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur S3 download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur S3 download": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Mark failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Mark failed": {
+      "main": [
+        []
+      ]
+    },
+    "IF - Extraction HTTP OK ?": {
+      "main": [
+        [
+          {
+            "node": "Code - Fusionner job + extraction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur extraction PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur extraction PDF": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer job en failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Texte extrait non vide ?": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Enregistrer document extrait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur texte vide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur texte vide": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Log erreur worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - audit_logs worker2": {
+      "main": [
+        []
+      ]
+    },
+    "IF - Chunks existent ?": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Enregistrer chunks",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur aucun chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur aucun chunk": {
+      "main": [
+        [
+          {
+            "node": "Postgres - audit_logs worker2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule - Worker PDF": {
+      "main": [
+        [
+          {
+            "node": "Redis - Pop job PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis - Pop job PDF": {
+      "main": [
+        [
+          {
+            "node": "IF - Job Redis existe ?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur payload Redis invalide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Job Redis existe ?": {
+      "main": [
+        [
+          {
+            "node": "Set - Normaliser payload job",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Erreur lock processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur payload Redis invalide": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer failed payload Redis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set - Erreur lock processing": {
+      "main": [
+        [
+          {
+            "node": "Postgres - Marquer failed job absent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Log erreur worker": {
+      "main": [
+        []
+      ]
+    },
+    "Code - Fusionner job + extraction": {
+      "main": [
+        [
+          {
+            "node": "IF - Texte extrait non vide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres - Marquer failed payload Redis": {
+      "main": [
+        []
+      ]
+    },
+    "Postgres - Marquer failed job absent": {
+      "main": [
+        []
+      ]
+    },
+    "Postgres - Marquer failed processing impossible": {
+      "main": [
+        []
+      ]
+    },
+    "Postgres - Marquer failed aucun chunk": {
+      "main": [
+        []
+      ]
+    },
+    "Set - Préparer contexte utilisateur": {
+      "main": [
+        [
+          {
+            "node": "IF - Question valide ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Question valide ?": {
+      "main": [
+        [
+          {
+            "node": "RAG - Générer la réponse à partir des documents",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set - Question invalide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timeSavedPerExecution": 0
+  },
+  "versionId": "aa24df3b-f494-45d7-8d0c-74f658e4d970",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "08a5a7ca1053f8e73004eb8a4a70aa60f597d80f00d24abfe1fd3a3c4d28486d"
+  },
+  "id": "j2Mn8niDG3cGDCPs",
+  "tags": []
+}
