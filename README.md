@@ -28,7 +28,7 @@
 ## Image Workflow
 
 <p align="center">
-  <img src="https://github.com/Tchatchoua14/n8n-rag-pdf-pipeline/blob/main/End-to-End%20Async%20PDF%20Processing.png" alt="n8n Logo" />
+  <img src="https://github.com/Tchatchoua14/n8n-rag-pdf-pipeline/blob/main/DocFlow%20RAG.png" alt="n8n Logo" />
 </p>
 
 ---
